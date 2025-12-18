@@ -3,11 +3,13 @@ import argparse
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
 from prompts import system_prompt
 from functions.get_files_info import schema_get_files_info
 from functions.get_file_content import schema_get_file_content
 from functions.run_python_file import schema_run_python_file
 from functions.write_file import schema_write_file
+from call_function_module import call_function
 
 parser = argparse.ArgumentParser(description="Chatbot")
 parser.add_argument("user_prompt", type=str, help="User prompt")
@@ -68,6 +70,29 @@ else:
     else:
         print("Response:")
         print(response.text)
+
+function_calls = getattr(response, "function_calls", None)
+tool_results_parts = []
+
+if function_calls:
+    for function_call_part in function_calls:
+        function_call_result = call_function(function_call_part, verbose=args.verbose)
+
+        if (
+            not function_call_result.parts or function_call_result.parts[0].function_response is None
+        ):
+            raise RuntimeError("Function call did not return a valid function_response")
+        
+        part = function_call_result.parts[0]
+        tool_results_parts.append(part)
+
+        if args.verbose:
+            print(f"-> {part.function_response.response}")
+
+else:
+    print("Response:")
+    print(response.text)
+    
 
 def main():
     print("Hello from bootdev-ai-agent!")
