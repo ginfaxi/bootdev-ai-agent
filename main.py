@@ -40,62 +40,84 @@ config = types.GenerateContentConfig(
     system_instruction=system_prompt,
 )
 
-response = client.models.generate_content(
-    model='gemini-2.5-flash', 
-    contents=messages, 
-    config=config,
-)
+# --- replace everything from the first generate_content call to the end of file with this ---
 
-if response.usage_metadata is None:
-    raise RuntimeError("Gemini API response missing usage_metadata")
+MAX_ITERS = 20
 
-usage = response.usage_metadata
 
-if args.verbose:
-    print(f"User prompt: {args.user_prompt}")
-    print(f"Prompt tokens: {usage.prompt_token_count}")
-    print(f"Response tokens: {usage.candidates_token_count}")
+def candidate_has_function_call(candidate) -> bool:
+    if not getattr(candidate, "content", None) or not getattr(candidate.content, "parts", None):
+        return False
+    for part in candidate.content.parts:
+        if getattr(part, "function_call", None) is not None:
+            return True
+    return False
 
-function_calls = getattr(response, "function_calls", None)
-
-if function_calls:
-    for func in function_calls:
-        print(f"Calling function: {func.name}({func.args})")
-else:
-    lower_prompt = args.user_prompt.lower()
-    if "pkg" in lower_prompt:
-        print("Calling function: get_files_info({'directory': 'pkg'})")
-    elif "root" in lower_prompt:
-        print("Calling function: get_files_info({'directory': '.'})")
-    else:
-        print("Response:")
-        print(response.text)
-
-function_calls = getattr(response, "function_calls", None)
-tool_results_parts = []
-
-if function_calls:
-    for function_call_part in function_calls:
-        function_call_result = call_function(function_call_part, verbose=args.verbose)
-
-        if (
-            not function_call_result.parts or function_call_result.parts[0].function_response is None
-        ):
-            raise RuntimeError("Function call did not return a valid function_response")
-        
-        part = function_call_result.parts[0]
-        tool_results_parts.append(part)
-
-        if args.verbose:
-            print(f"-> {part.function_response.response}")
-
-else:
-    print("Response:")
-    print(response.text)
-    
 
 def main():
-    print("Hello from bootdev-ai-agent!")
+    for i in range(MAX_ITERS):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=messages,  # IMPORTANT: entire conversation every time
+                config=config,
+            )
+        except Exception as e:
+            print(f"Error calling model: {e}")
+            return
+
+        if response.usage_metadata is None:
+            raise RuntimeError("Gemini API response missing usage_metadata")
+
+        if args.verbose:
+            usage = response.usage_metadata
+            print(f"\n--- Iteration {i+1} ---")
+            print(f"Prompt tokens: {usage.prompt_token_count}")
+            print(f"Response tokens: {usage.candidates_token_count}")
+
+        # 1) Add every candidate.content to messages
+        candidates = response.candidates or []
+        for cand in candidates:
+            if getattr(cand, "content", None) is not None:
+                messages.append(cand.content)
+
+        # 2) Decide if model is finished:
+        # finished only if NO candidate has a function call AND response.text is non-empty
+        any_tool_calls = any(candidate_has_function_call(c) for c in candidates)
+        final_text = (response.text or "").strip()
+
+        if (not any_tool_calls) and final_text:
+            print("Final response:")
+            print(final_text)
+            return
+
+        # 3) If there are tool calls, execute them and append tool results as a USER message
+        function_calls = getattr(response, "function_calls", None)
+        tool_results_parts = []
+
+        if function_calls:
+            for func in function_calls:
+                print(f" - Calling function: {func.name}")
+
+                function_call_result = call_function(func, verbose=args.verbose)
+
+                if (
+                    not function_call_result.parts
+                    or function_call_result.parts[0].function_response is None
+                ):
+                    raise RuntimeError("Function call did not return a valid function_response")
+
+                part = function_call_result.parts[0]
+                tool_results_parts.append(part)
+
+                if args.verbose:
+                    print(f"-> {part.function_response.response}")
+
+        # Append tool results as a single user message so the model can continue
+        if tool_results_parts:
+            messages.append(types.Content(role="user", parts=tool_results_parts))
+
+    print("Error: maximum iterations reached without a final answer.")
 
 
 if __name__ == "__main__":
